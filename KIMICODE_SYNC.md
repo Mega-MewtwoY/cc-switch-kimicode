@@ -74,7 +74,8 @@ cd src-tauri && cargo check && cargo test
    上游对 `category == "official"` 的供应商隐藏检测与用量配置按钮、
    且 `stream_check` 拒绝解析 base_url（封号保护）。KimiCode 的官方
    供应商是自动导入的本地 OAuth 配置，base_url 在嵌套路径
-   `settings_config.provider.base_url`，需要保留检测与用量入口：
+   `settings_config.providers.<id>.base_url`（live 导入的整文档形态），
+   需要保留检测与用量入口：
    - `services/stream_check.rs` `resolve_base_url`：official 早退
      对 `AppType::KimiCode` 豁免（有回归测试
      `kimicode_official_provider_resolves_nested_base_url`）。
@@ -114,9 +115,13 @@ cd src-tauri && cargo check && cargo test
   用量脚本（Coding Plan 等）：后端 `provider.rs`
   `resolve_usage_credentials` 的 KimiCode 分支与前端
   `UsageScriptModal.tsx` `getProviderCredentials` 的 kimicode
-  分支互为镜像，都读 `settings_config.provider.{base_url,api_key}`，
+  分支互为镜像，两种存储形态都要支持：预设/表单的单供应商形态
+  `settings_config.provider.{base_url,api_key}`，以及 live 导入的
+  整文档形态 `settings_config.providers.<供应商id>.{base_url,api_key}`
+  （后者按自身 id → `models[default_model].provider` 指针 →
+  单条目兜底的顺序定位，官方 managed:kimi-code 即此形态），
   改动须两边同步（漏前端会导致测试报 Unknown coding plan provider）。
-  OAuth 令牌：官方供应商 `provider.api_key` 为空，令牌由 kimi CLI
+  OAuth 令牌：官方供应商 `api_key` 为空，令牌由 kimi CLI
   存在 `<kimi_dir>/credentials/kimi-code.json`；
   `kimicode_config::load_or_refresh_oauth_access_token` 读取并按需
   续期（access_token 寿命仅 15 分钟，kimi CLI 不在前台时不会刷新；

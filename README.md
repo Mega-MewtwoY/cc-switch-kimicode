@@ -72,7 +72,7 @@ cd src-tauri && cargo test   # 后端测试
 
 ## 与上游的关系
 
-- 基于上游 v3.19.2，会不定期合并上游更新
+- 基于上游 v3.20.3，会不定期合并上游更新
 - 所有定制改动集中在 `kimicode` 相关模块，分叉点和合并策略记录在 [KIMICODE_SYNC.md](KIMICODE_SYNC.md)
 - 与 Kimi Code 无关的问题请优先到[上游仓库](https://github.com/farion1231/cc-switch)反馈
 
