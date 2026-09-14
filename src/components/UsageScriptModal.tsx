@@ -309,9 +309,25 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
             baseUrl: options.baseURL,
           };
         } else if (appId === "kimicode") {
-          // Kimi Code: 凭据嵌在 provider.{base_url, api_key}（snake_case，对应 config.toml）
+          // Kimi Code 两种存储形态：预设/表单的单供应商形态
+          // provider.{base_url, api_key}；以及从 live config.toml 导入的整文档
+          // 形态 providers.<供应商id>.{base_url, api_key}（官方 managed:kimi-code
+          // 即此形态），键不匹配时经 models[default_model].provider 指针定位，
+          // 单条目 map 直接取用。
           // 镜像后端 Provider::resolve_usage_credentials 的 KimiCode 分支
-          const p = (config as any).provider || {};
+          const cfg = config as any;
+          const map: Record<string, any> =
+            cfg.providers && typeof cfg.providers === "object"
+              ? cfg.providers
+              : {};
+          const pointed = cfg.models?.[cfg.default_model]?.provider;
+          const entries = Object.values(map);
+          const p =
+            map[provider.id] ??
+            (typeof pointed === "string" ? map[pointed] : undefined) ??
+            (entries.length === 1 ? entries[0] : undefined) ??
+            cfg.provider ??
+            {};
           return {
             apiKey: p.api_key,
             baseUrl: p.base_url,

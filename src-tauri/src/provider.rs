@@ -230,12 +230,38 @@ impl Provider {
                     str_at(options.and_then(|o| o.get("apiKey"))),
                 )
             }
-            // Kimi Code nests credentials under `provider`（snake_case，与 config.toml 一致）。
+            // Kimi Code 有两种存储形态：
+            // - 预设/表单写入的单供应商形态：`provider.{base_url, api_key}`
+            // - 从 live config.toml 导入的整文档形态（官方 managed:kimi-code 即此形态）：
+            //   凭据在 `providers.<供应商id>` 下，键不匹配时经
+            //   `models[default_model].provider` 指针定位，单条目 map 直接取用
             AppType::KimiCode => {
-                let provider = settings.get("provider");
+                let from_map = settings
+                    .get("providers")
+                    .and_then(Value::as_object)
+                    .and_then(|map| {
+                        map.get(&self.id)
+                            .or_else(|| {
+                                settings
+                                    .get("default_model")
+                                    .and_then(Value::as_str)
+                                    .and_then(|m| settings.get("models").and_then(|ms| ms.get(m)))
+                                    .and_then(|m| m.get("provider"))
+                                    .and_then(Value::as_str)
+                                    .and_then(|id| map.get(id))
+                            })
+                            .or_else(|| {
+                                if map.len() == 1 {
+                                    map.values().next()
+                                } else {
+                                    None
+                                }
+                            })
+                    });
+                let node = from_map.or_else(|| settings.get("provider"));
                 (
-                    str_at(provider.and_then(|p| p.get("base_url"))),
-                    str_at(provider.and_then(|p| p.get("api_key"))),
+                    str_at(node.and_then(|p| p.get("base_url"))),
+                    str_at(node.and_then(|p| p.get("api_key"))),
                 )
             }
             // Claude and Claude Desktop both use the Anthropic-style env map, keeping
@@ -1758,6 +1784,94 @@ mod tests {
         assert_eq!(
             p.resolve_usage_credentials(&AppType::Claude),
             (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_single_preset_shape() {
+        // 预设/表单写入的单供应商形态：provider.{base_url, api_key}
+        let p = provider_with(json!({
+            "provider": {
+                "type": "openai",
+                "api_key": "sk-moonshot",
+                "base_url": "https://api.moonshot.cn/v1"
+            },
+            "models": {},
+            "default_model": ""
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            (
+                "https://api.moonshot.cn/v1".to_string(),
+                "sk-moonshot".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_live_imported_map_shape() {
+        // 从 live config.toml 导入的供应商存整文档：凭据在 providers.<自身id> 下。
+        // 官方 managed:kimi-code 即此形态——修复前解析出空 base_url，Kimi 套餐
+        // 用量查询报 "Unknown coding plan provider"。
+        let mut p = provider_with(json!({
+            "default_model": "kimi-code/k3",
+            "providers": {
+                "managed:kimi-code": {
+                    "type": "kimi",
+                    "api_key": "sk-kimi",
+                    "base_url": "https://api.kimi.com/coding/v1"
+                }
+            },
+            "models": {
+                "kimi-code/k3": { "model": "k3", "provider": "managed:kimi-code" }
+            }
+        }));
+        p.id = "managed:kimi-code".to_string();
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            (
+                "https://api.kimi.com/coding/v1".to_string(),
+                "sk-kimi".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_map_uses_default_model_pointer() {
+        // providers map 键与供应商 id 不一致时，经 models[default_model].provider 定位。
+        let p = provider_with(json!({
+            "default_model": "kimi-code/k3",
+            "providers": {
+                "upstream-a": { "api_key": "sk-a", "base_url": "https://a.example.com/v1" },
+                "upstream-b": { "api_key": "sk-b", "base_url": "https://b.example.com/v1" }
+            },
+            "models": {
+                "kimi-code/k3": { "model": "k3", "provider": "upstream-b" }
+            }
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            (
+                "https://b.example.com/v1".to_string(),
+                "sk-b".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_single_entry_map_fallback() {
+        // 单条目 providers map：id 与 default_model 都对不上时取唯一条目。
+        let p = provider_with(json!({
+            "providers": {
+                "only-one": { "api_key": "sk-one", "base_url": "https://one.example.com/v1/" }
+            }
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            (
+                "https://one.example.com/v1".to_string(),
+                "sk-one".to_string()
+            )
         );
     }
 }

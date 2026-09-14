@@ -336,22 +336,20 @@ impl StreamCheckService {
             })
     }
 
-    /// Kimi Code: `{ provider: { base_url, api_key, ... }, models, default_model }`（snake_case）
+    /// Kimi Code 的 base_url：单供应商形态 `provider.base_url` 与 live 导入的
+    /// `providers.<id>.base_url` 形态都由 `resolve_usage_credentials` 统一解析。
     fn extract_kimicode_base_url(provider: &Provider) -> Result<String, AppError> {
-        provider
-            .settings_config
-            .get("provider")
-            .and_then(|p| p.get("base_url"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                AppError::localized(
-                    "kimicode_base_url_missing",
-                    "Kimi Code 供应商缺少 base_url",
-                    "Kimi Code provider is missing `base_url`",
-                )
-            })
+        let (base_url, _) = provider.resolve_usage_credentials(&AppType::KimiCode);
+        let base_url = base_url.trim().to_string();
+        if base_url.is_empty() {
+            Err(AppError::localized(
+                "kimicode_base_url_missing",
+                "Kimi Code 供应商缺少 base_url",
+                "Kimi Code provider is missing `base_url`",
+            ))
+        } else {
+            Ok(base_url)
+        }
     }
 
     /// OpenCode: `{ npm, options: { baseURL, apiKey }, ... }`
