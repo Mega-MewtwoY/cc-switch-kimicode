@@ -14,6 +14,9 @@ const REFETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 export const subscriptionKeys = {
   all: ["subscription"] as const,
   quota: (appId: AppId) => [...subscriptionKeys.all, "quota", appId] as const,
+  // 按供应商条目查询（codex 多账号：每个条目各自的凭据与额度）
+  providerQuota: (appId: AppId, providerId: string) =>
+    [...subscriptionKeys.all, "quota", appId, providerId] as const,
 };
 
 /**
@@ -76,11 +79,17 @@ function useQuotaKeepLastGood(
   };
 }
 
+/**
+ * providerId（仅 codex 多账号条目传入）：按供应商条目查询，每个条目各自的
+ * 凭据与额度；查询 key 与 keep-last-good scope 都绑定到该条目，避免两个
+ * OpenAI 账号的快照互相污染。缺省时走共享 live 凭据路径（原行为）。
+ */
 export function useSubscriptionQuota(
   appId: AppId,
   enabled: boolean,
   autoQuery = false,
   autoQueryIntervalMinutes = 5,
+  providerId?: string,
 ) {
   const refetchInterval =
     autoQuery && autoQueryIntervalMinutes > 0
@@ -88,8 +97,10 @@ export function useSubscriptionQuota(
       : false;
 
   const query = useQuery({
-    queryKey: subscriptionKeys.quota(appId),
-    queryFn: () => subscriptionApi.getQuota(appId),
+    queryKey: providerId
+      ? subscriptionKeys.providerQuota(appId, providerId)
+      : subscriptionKeys.quota(appId),
+    queryFn: () => subscriptionApi.getQuota(appId, providerId),
     enabled:
       enabled && ["claude", "codex", "gemini", "grokbuild"].includes(appId),
     refetchInterval,
@@ -102,13 +113,14 @@ export function useSubscriptionQuota(
     retry: 1,
   });
 
-  return useQuotaKeepLastGood(query, appId);
+  return useQuotaKeepLastGood(query, providerId ?? appId);
 }
 
 export interface UseCodexOauthQuotaOptions {
   enabled?: boolean;
-  /** 是否启用自动轮询（5 分钟）与窗口 focus 重取 */
+  /** 是否启用自动轮询与窗口 focus 重取 */
   autoQuery?: boolean;
+  autoQueryIntervalMinutes?: number;
 }
 
 /**
@@ -123,15 +135,26 @@ export function useCodexOauthQuotaByAccountId(
   accountId: string | null,
   options: UseCodexOauthQuotaOptions = {},
 ) {
-  const { enabled = true, autoQuery = false } = options;
+  const {
+    enabled = true,
+    autoQuery = false,
+    autoQueryIntervalMinutes = 5,
+  } = options;
+  const refetchInterval =
+    autoQuery && autoQueryIntervalMinutes > 0
+      ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
+      : false;
   const query = useQuery({
     queryKey: ["codex_oauth", "quota", accountId ?? "default"],
     queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
     enabled,
-    refetchInterval: autoQuery ? REFETCH_INTERVAL : false,
-    refetchIntervalInBackground: autoQuery,
-    refetchOnWindowFocus: autoQuery,
-    staleTime: REFETCH_INTERVAL,
+    refetchInterval,
+    refetchIntervalInBackground: Boolean(refetchInterval),
+    refetchOnWindowFocus: Boolean(refetchInterval),
+    staleTime:
+      autoQueryIntervalMinutes > 0
+        ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
+        : REFETCH_INTERVAL,
     retry: 1,
   });
 
@@ -164,8 +187,19 @@ export function useXaiOauthQuota(
   meta: ProviderMeta | undefined,
   options: UseCodexOauthQuotaOptions = {},
 ) {
-  const { enabled = true, autoQuery = false } = options;
   const accountId = resolveManagedAccountId(meta, PROVIDER_TYPES.XAI_OAUTH);
+  return useXaiOauthQuotaByAccountId(accountId, options);
+}
+
+/**
+ * xAI OAuth 订阅额度（按账号 ID）：授权中心逐个账号显示额度时用。
+ * Query key 与 `useXaiOauthQuota` 一致，绑定同一账号的供应商卡片共用缓存。
+ */
+export function useXaiOauthQuotaByAccountId(
+  accountId: string | null,
+  options: UseCodexOauthQuotaOptions = {},
+) {
+  const { enabled = true, autoQuery = false } = options;
   const query = useQuery({
     queryKey: ["xai_oauth", "quota", accountId ?? "default"],
     queryFn: () => subscriptionApi.getXaiOauthQuota(accountId),

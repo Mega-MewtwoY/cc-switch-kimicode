@@ -23,7 +23,7 @@ impl Database {
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
                         readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild,
-                        enabled_opencode, enabled_hermes, enabled_kimicode, installed_at, content_hash, updated_at
+                        enabled_opencode, enabled_hermes, enabled_kimicode, enabled_zcode, installed_at, content_hash, updated_at, enabled_mcode
                  FROM skills ORDER BY name ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -47,10 +47,12 @@ impl Database {
                         opencode: row.get(12)?,
                         hermes: row.get(13)?,
                         kimicode: row.get(14)?,
+                        pi: false,
+                        mcode: row.get(19)?,
                     },
-                    installed_at: row.get(15)?,
-                    content_hash: row.get(16)?,
-                    updated_at: row.get::<_, i64>(17).unwrap_or(0),
+                    installed_at: row.get(16)?,
+                    content_hash: row.get(17)?,
+                    updated_at: row.get::<_, i64>(18).unwrap_or(0),
                 })
             })
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -70,7 +72,7 @@ impl Database {
             .prepare(
                 "SELECT id, name, description, directory, repo_owner, repo_name, repo_branch,
                         readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild,
-                        enabled_opencode, enabled_hermes, enabled_kimicode, installed_at, content_hash, updated_at
+                        enabled_opencode, enabled_hermes, enabled_kimicode, enabled_zcode, installed_at, content_hash, updated_at, enabled_mcode
                  FROM skills WHERE id = ?1",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -93,10 +95,12 @@ impl Database {
                     opencode: row.get(12)?,
                     hermes: row.get(13)?,
                     kimicode: row.get(14)?,
+                    pi: false,
+                    mcode: row.get(19)?,
                 },
-                installed_at: row.get(15)?,
-                content_hash: row.get(16)?,
-                updated_at: row.get::<_, i64>(17).unwrap_or(0),
+                installed_at: row.get(16)?,
+                content_hash: row.get(17)?,
+                updated_at: row.get::<_, i64>(18).unwrap_or(0),
             })
         });
 
@@ -113,9 +117,9 @@ impl Database {
         conn.execute(
             "INSERT OR REPLACE INTO skills
              (id, name, description, directory, repo_owner, repo_name, repo_branch,
-              readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild, enabled_opencode, enabled_hermes, enabled_kimicode,
-              installed_at, content_hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+              readme_url, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild, enabled_opencode, enabled_hermes, enabled_kimicode, enabled_zcode,
+              installed_at, content_hash, updated_at, enabled_mcode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 skill.id,
                 skill.name,
@@ -132,9 +136,11 @@ impl Database {
                 skill.apps.opencode,
                 skill.apps.hermes,
                 skill.apps.kimicode,
+                false,
                 skill.installed_at,
                 skill.content_hash,
                 skill.updated_at,
+                skill.apps.mcode,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -203,8 +209,8 @@ impl Database {
         let conn = lock_conn!(self.conn);
         let affected = conn
             .execute(
-                "UPDATE skills SET enabled_claude = ?1, enabled_codex = ?2, enabled_gemini = ?3, enabled_grokbuild = ?4, enabled_opencode = ?5, enabled_hermes = ?6, enabled_kimicode = ?7 WHERE id = ?8",
-                params![apps.claude, apps.codex, apps.gemini, apps.grokbuild, apps.opencode, apps.hermes, apps.kimicode, id],
+                "UPDATE skills SET enabled_claude = ?1, enabled_codex = ?2, enabled_gemini = ?3, enabled_grokbuild = ?4, enabled_opencode = ?5, enabled_hermes = ?6, enabled_kimicode = ?7, enabled_zcode = ?8, enabled_mcode = ?9 WHERE id = ?10",
+                params![apps.claude, apps.codex, apps.gemini, apps.grokbuild, apps.opencode, apps.hermes, apps.kimicode, false, apps.mcode, id],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(affected > 0)

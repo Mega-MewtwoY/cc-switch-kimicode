@@ -95,6 +95,8 @@ pub fn import_from_claude(config: &mut MultiAppConfig) -> Result<usize, AppError
                         opencode: false,
                         hermes: false,
                         kimicode: false,
+                        mcode: false,
+                        pi: false,
                     },
                     description: None,
                     homepage: None,

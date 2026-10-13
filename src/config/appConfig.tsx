@@ -1,5 +1,6 @@
 import React from "react";
 import type { AppId } from "@/lib/api/types";
+import type { VisibleApps } from "@/types";
 import {
   ClaudeIcon,
   CodexIcon,
@@ -25,10 +26,32 @@ export const APP_IDS: AppId[] = [
   "openclaw",
   "hermes",
   "kimicode",
+  "doubao",
+  "pi",
+  "mcode",
 ];
 
-/** App IDs shown in Skills panels (excludes OpenClaw — it doesn't support Skills) */
-export const SKILLS_APP_IDS: AppId[] = [
+export const DEFAULT_VISIBLE_APPS: VisibleApps = {
+  claude: true,
+  "claude-desktop": true,
+  codex: true,
+  gemini: true,
+  grokbuild: true,
+  opencode: true,
+  openclaw: true,
+  hermes: true,
+  kimicode: true,
+  doubao: true,
+  pi: true,
+  mcode: true,
+};
+
+/** App IDs shown in Skills panels. */
+export type SkillAppId = Exclude<
+  AppId,
+  "claude-desktop" | "openclaw" | "doubao"
+>;
+export const SKILLS_APP_IDS: SkillAppId[] = [
   "claude",
   "codex",
   "gemini",
@@ -36,10 +59,86 @@ export const SKILLS_APP_IDS: AppId[] = [
   "opencode",
   "hermes",
   "kimicode",
+  "pi",
+  "mcode",
 ];
 
-/** App IDs shown in MCP panels (excludes OpenClaw) */
-export const MCP_APP_IDS: AppId[] = [...SKILLS_APP_IDS];
+export type ProxyAppId = Extract<
+  AppId,
+  "claude" | "codex" | "gemini" | "grokbuild"
+>;
+
+/** Apps with a complete local gateway + failover data plane. */
+export const PROXY_APP_IDS: ProxyAppId[] = [
+  "claude",
+  "codex",
+  "gemini",
+  "grokbuild",
+];
+
+export function isProxyAppId(appId: string): appId is ProxyAppId {
+  return (PROXY_APP_IDS as string[]).includes(appId);
+}
+
+/** 支持 Stack 模式的应用（后端 `mode::stack::supports_stack` 的镜像）。 */
+export type StackAppId = Extract<ProxyAppId, "claude" | "codex">;
+
+export const STACK_APP_IDS: StackAppId[] = ["claude", "codex"];
+
+export function isStackAppId(appId: string): appId is StackAppId {
+  return (STACK_APP_IDS as string[]).includes(appId);
+}
+
+export type AdditiveAppId = Extract<
+  AppId,
+  "opencode" | "openclaw" | "hermes" | "kimicode" | "pi" | "mcode"
+>;
+
+export const ADDITIVE_APP_IDS: AdditiveAppId[] = [
+  "mcode",
+  "opencode",
+  "openclaw",
+  "hermes",
+  "kimicode",
+  "pi",
+];
+
+export function isAdditiveAppId(appId: string): appId is AdditiveAppId {
+  return (ADDITIVE_APP_IDS as string[]).includes(appId);
+}
+
+/**
+ * 切换只替换关键字段的应用：供应商编辑器显示「切到这个供应商之后配置文件的样子」，由后端
+ * `ProviderService::editor_view` 投影。
+ */
+export const EDITOR_VIEW_APP_IDS: AppId[] = [
+  "claude",
+  "codex",
+  "gemini",
+  "grokbuild",
+];
+
+export function usesEditorView(appId: AppId): boolean {
+  return EDITOR_VIEW_APP_IDS.includes(appId);
+}
+
+/** Claude Desktop、OpenClaw、豆包不由 CC Switch 管理 MCP；Pi 1.0 起内置 MCP（`~/.pi/agent/mcp.json`） */
+export type McpAppId = Exclude<AppId, "claude-desktop" | "openclaw" | "doubao">;
+export const MCP_APP_IDS: McpAppId[] = [
+  "claude",
+  "codex",
+  "gemini",
+  "grokbuild",
+  "opencode",
+  "hermes",
+  "kimicode",
+  "pi",
+  "mcode",
+];
+
+export function isMcpAppId(appId: string): appId is McpAppId {
+  return (MCP_APP_IDS as string[]).includes(appId);
+}
 
 export const APP_ICON_MAP: Record<AppId, AppConfig> = {
   claude: {
@@ -142,4 +241,31 @@ export const APP_ICON_MAP: Record<AppId, AppConfig> = {
     badgeClass:
       "bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-500/20 border-0 gap-1.5",
   },
+  doubao: {
+    label: "豆包",
+    icon: <ProviderIcon icon="doubao" name="豆包" size={14} />,
+    activeClass:
+      "bg-blue-500/10 ring-1 ring-blue-500/20 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400",
+    badgeClass:
+      "bg-blue-500/10 text-blue-700 dark:text-blue-300 hover:bg-blue-500/20 border-0 gap-1.5",
+  },
+  mcode: {
+    label: "MiniMax Code",
+    icon: <ProviderIcon icon="minimax" name="MiniMax Code" size={14} />,
+    activeClass: "bg-orange-500/10 text-orange-600 dark:text-orange-400",
+    badgeClass:
+      "bg-orange-500/10 text-orange-700 dark:text-orange-300 border-0 gap-1.5",
+  },
+  pi: {
+    label: "Pi",
+    icon: <ProviderIcon icon="pi" name="Pi" size={14} showFallback={false} />,
+    activeClass:
+      "bg-fuchsia-500/10 ring-1 ring-fuchsia-500/20 hover:bg-fuchsia-500/20 text-fuchsia-600 dark:text-fuchsia-400",
+    badgeClass:
+      "bg-fuchsia-500/10 text-fuchsia-700 dark:text-fuchsia-300 hover:bg-fuchsia-500/20 border-0 gap-1.5",
+  },
 };
+
+export function getAppLabel(appId: string): string {
+  return APP_ICON_MAP[appId as AppId]?.label ?? appId;
+}

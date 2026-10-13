@@ -153,6 +153,16 @@ pub(crate) fn build_provider_from_request(
         AppType::OpenClaw => build_additive_app_settings(request),
         AppType::Hermes => build_hermes_settings(request),
         AppType::KimiCode => build_kimicode_settings(request),
+        AppType::Mcode => {
+            return Err(AppError::InvalidInput(
+                "Add MCode providers from the MCode page".into(),
+            ))
+        }
+        AppType::Pi => {
+            return Err(AppError::InvalidInput(
+                "Pi providers must be added from the Pi provider page".to_string(),
+            ));
+        }
     };
 
     // Build usage script configuration if provided
@@ -605,10 +615,7 @@ fn build_kimicode_settings(request: &DeepLinkImportRequest) -> serde_json::Value
     config.insert("provider".to_string(), json!(provider));
 
     if let Some(model) = &request.model {
-        config.insert(
-            "models".to_string(),
-            json!({ model: { "model": model } }),
-        );
+        config.insert("models".to_string(), json!({ model: { "model": model } }));
         config.insert("default_model".to_string(), json!(model));
     }
 

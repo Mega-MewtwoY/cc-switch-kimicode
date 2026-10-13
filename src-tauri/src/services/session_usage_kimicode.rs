@@ -23,7 +23,9 @@ use crate::services::session_usage::{
     get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
 use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -147,10 +149,40 @@ fn sync_single_wire_file(db: &Database, file: &KimiWireFile) -> Result<(u32, u32
         return Ok((0, 0));
     }
 
-    let fh = fs::File::open(&file.path)
-        .map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
-    let reader = BufReader::new(fh);
+    let (mut imported, mut skipped, mut line_offset, mut had_error) =
+        sync_wire_lines(db, file, last_offset)?;
 
+    if last_offset > 0 && line_offset <= last_offset {
+        // Kimi 重建/截短日志后，旧行号不能再作为新文件的游标；
+        // 行数相同的原地重写也需要重查。
+        // 重新扫描现存行；insert_kimicode_record 会区分同一行号的旧/新事件。
+        log::warn!(
+            "[KIMICODE-SYNC] 文件已修改但行数未增加（旧 {last_offset}，新 {line_offset}），重新扫描: {}",
+            file.path.display()
+        );
+        let (replayed, replay_skipped, new_offset, replay_error) = sync_wire_lines(db, file, 0)?;
+        imported += replayed;
+        skipped += replay_skipped;
+        line_offset = new_offset;
+        had_error |= replay_error;
+    }
+
+    // 有插入错误时不推进游标，下次全量重扫（request_id 保证不重双）
+    if !had_error {
+        update_sync_state(db, &file_path_str, file_modified, line_offset)?;
+    }
+
+    Ok((imported, skipped))
+}
+
+fn sync_wire_lines(
+    db: &Database,
+    file: &KimiWireFile,
+    last_offset: i64,
+) -> Result<(u32, u32, i64, bool), AppError> {
+    let fh =
+        fs::File::open(&file.path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
+    let reader = BufReader::new(fh);
     let mut imported = 0u32;
     let mut skipped = 0u32;
     let mut line_offset: i64 = 0;
@@ -191,12 +223,7 @@ fn sync_single_wire_file(db: &Database, file: &KimiWireFile) -> Result<(u32, u32
         }
     }
 
-    // 有插入错误时不推进游标，下次全量重扫（INSERT OR IGNORE 保证不重双）
-    if !had_error {
-        update_sync_state(db, &file_path_str, file_modified, line_offset)?;
-    }
-
-    Ok((imported, skipped))
+    Ok((imported, skipped, line_offset, had_error))
 }
 
 /// 解析一行 wire.jsonl，非 usage.record(turn) 或全零 token 返回 None
@@ -212,7 +239,10 @@ fn parse_usage_record(line: &str) -> Option<KimiUsageRecord> {
     }
 
     let usage = value.get("usage")?;
-    let input_tokens = usage.get("inputOther").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let input_tokens = usage
+        .get("inputOther")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     let output_tokens = usage.get("output").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let cache_read_tokens = usage
         .get("inputCacheRead")
@@ -272,7 +302,58 @@ fn insert_kimicode_record(
         cache_creation_tokens: record.cache_creation_tokens,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
+    // 旧版 request_id 只含行号。文件被截短后，新事件可能占用旧行号；
+    // 相同负载仍视为已导入，不同负载使用内容指纹稳定地区分。
+    let existing = conn
+        .query_row(
+            "SELECT model, input_tokens, output_tokens, cache_read_tokens, \
+                    cache_creation_tokens, created_at \
+             FROM proxy_request_logs WHERE request_id = ?1",
+            [request_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| AppError::Database(format!("检查 Kimi Code 旧记录失败: {e}")))?;
+    let effective_request_id =
+        if let Some((model, input, output, cache_read, cache_creation, ts)) = existing {
+            if model == record.model
+                && input == i64::from(record.input_tokens)
+                && output == i64::from(record.output_tokens)
+                && cache_read == i64::from(record.cache_read_tokens)
+                && cache_creation == i64::from(record.cache_creation_tokens)
+                && ts == created_at
+            {
+                return Ok(false);
+            }
+            let fingerprint = format!(
+                "{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        record.model,
+                        record.timestamp_ms,
+                        record.input_tokens,
+                        record.output_tokens,
+                        record.cache_read_tokens,
+                        record.cache_creation_tokens
+                    )
+                    .as_bytes()
+                )
+            );
+            format!("{request_id}:{fingerprint}")
+        } else {
+            request_id.to_string()
+        };
+    if should_skip_session_insert(&conn, &effective_request_id, &dedup_key)? {
         return Ok(false);
     }
 
@@ -283,6 +364,7 @@ fn insert_kimicode_record(
             output_tokens: record.output_tokens,
             cache_read_tokens: record.cache_read_tokens,
             cache_creation_tokens: record.cache_creation_tokens,
+            cache_creation_1h_tokens: 0,
             model: Some(record.model.clone()),
             message_id: None,
         };
@@ -322,7 +404,7 @@ fn insert_kimicode_record(
             provider_type, is_streaming, cost_multiplier, created_at, data_source
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         rusqlite::params![
-            request_id,
+            effective_request_id,
             "_kimicode_session",   // provider_id
             "kimicode",            // app_type
             record.model,
@@ -395,8 +477,7 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let wire = root
-            .join("sessions/wd_proj_abc/session_1/agents/main/wire.jsonl");
+        let wire = root.join("sessions/wd_proj_abc/session_1/agents/main/wire.jsonl");
         fs::create_dir_all(wire.parent().unwrap()).unwrap();
         fs::write(&wire, "").unwrap();
         // 深度之外/非 wire 文件不应被收集
@@ -409,5 +490,58 @@ mod tests {
         assert_eq!(files[0].agent, "main");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imports_new_events_after_wire_file_is_truncated() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("wire.jsonl");
+        let file = KimiWireFile {
+            path: path.clone(),
+            session_id: "session-rebuilt".to_string(),
+            agent: "main".to_string(),
+        };
+        let db = Database::memory().expect("database");
+        let line = |tokens: u32, time: i64| {
+            format!(
+                "{{\"type\":\"usage.record\",\"model\":\"kimi-k2\",\"usage\":{{\"inputOther\":{tokens},\"output\":1}},\"usageScope\":\"turn\",\"time\":{time}}}\n"
+            )
+        };
+        let first = line(11, 1_786_363_400_000);
+        let second = line(12, 1_786_363_401_000);
+        let third = line(13, 1_786_363_402_000);
+        fs::write(&path, format!("{first}{second}{third}")).expect("initial wire");
+        assert_eq!(sync_single_wire_file(&db, &file).unwrap().0, 3);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let replacement = line(99, 1_786_363_403_000);
+        fs::write(&path, format!("{first}{replacement}")).expect("shortened wire");
+        let (imported, skipped) = sync_single_wire_file(&db, &file).unwrap();
+        assert_eq!((imported, skipped), (1, 1));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let appended = line(100, 1_786_363_404_000);
+        fs::write(&path, format!("{first}{replacement}{appended}")).expect("append wire");
+        assert_eq!(sync_single_wire_file(&db, &file).unwrap().0, 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let same_length_replacement = line(101, 1_786_363_405_000);
+        fs::write(
+            &path,
+            format!("{first}{replacement}{same_length_replacement}"),
+        )
+        .expect("rewrite same line count");
+        assert_eq!(sync_single_wire_file(&db, &file).unwrap().0, 1);
+
+        let conn = lock_conn!(db.conn);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE app_type = 'kimicode'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 6);
+        Ok(())
     }
 }

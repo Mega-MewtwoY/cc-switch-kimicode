@@ -16,6 +16,8 @@ type UsageCacheUpdatedPayload =
   | {
       kind: "subscription";
       appType: AppId;
+      /** 按供应商条目查询时存在（codex 多账号）；缺省为共享 live 凭据路径 */
+      providerId?: string;
       data: SubscriptionQuota;
     };
 
@@ -35,7 +37,9 @@ export function useUsageCacheBridge() {
       );
     } else if (payload.kind === "subscription") {
       queryClient.setQueryData<SubscriptionQuota>(
-        subscriptionKeys.quota(payload.appType),
+        payload.providerId
+          ? subscriptionKeys.providerQuota(payload.appType, payload.providerId)
+          : subscriptionKeys.quota(payload.appType),
         payload.data,
       );
     }

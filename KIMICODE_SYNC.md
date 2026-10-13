@@ -1,5 +1,7 @@
 # Kimi Code Harness 维护指南
 
+> 2026-10-13：定制源码已更新至 4.0.9，当前定制仓库为 https://github.com/Mega-MewtwoY/cc-switch-kimicode ，定制改动保存在 `main`。以下内容保留作为早期 `feat/kimicode` 分支的历史维护记录；其中的分支关系、版本和启动入口说明不代表当前版本。当前构建方法和启动目标以 [README.md](README.md) 及源码为准。
+
 本分支（`feat/kimicode`）在 CC Switch 上游基础上新增 Kimi Code CLI（kimi）支持。
 本文档说明如何在官方更新后同步，保证本改动不被覆盖。
 

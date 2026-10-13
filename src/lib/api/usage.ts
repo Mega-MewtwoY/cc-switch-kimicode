@@ -22,6 +22,9 @@ import type { TemplateType } from "@/config/constants";
 export const usageApi = {
   // Provider usage script methods
   query: async (providerId: string, appId: AppId): Promise<UsageResult> => {
+    if (appId === "doubao") {
+      return invoke("query_doubao_provider_usage", { providerId });
+    }
     return invoke("queryProviderUsage", { providerId, app: appId });
   },
 
@@ -36,6 +39,18 @@ export const usageApi = {
     userId?: string,
     templateType?: TemplateType,
   ): Promise<UsageResult> => {
+    if (appId === "doubao") {
+      return invoke("test_doubao_usage_script", {
+        providerId,
+        scriptCode,
+        timeout,
+        apiKey,
+        baseUrl,
+        accessToken,
+        userId,
+        templateType,
+      });
+    }
     return invoke("testUsageScript", {
       providerId,
       app: appId,
@@ -66,6 +81,13 @@ export const usageApi = {
     });
   },
 
+  getSessionUsageSummary: async (
+    appType: string,
+    sessionId: string,
+  ): Promise<UsageSummary> => {
+    return invoke("get_session_usage_summary", { appType, sessionId });
+  },
+
   getUsageSummaryByApp: async (
     startDate?: number,
     endDate?: number,
@@ -90,6 +112,19 @@ export const usageApi = {
     return invoke("get_usage_trends", {
       startDate,
       endDate,
+      appType,
+      providerName,
+      model,
+    });
+  },
+
+  /** 最早有用量记录的本地日期 `YYYY-MM-DD`，没有记录时为 null */
+  getUsageFirstDate: async (
+    appType?: string,
+    providerName?: string,
+    model?: string,
+  ): Promise<string | null> => {
+    return invoke("get_usage_first_date", {
       appType,
       providerName,
       model,
@@ -201,6 +236,11 @@ export const usageApi = {
   // Session usage sync
   syncSessionUsage: async (): Promise<SessionSyncResult> => {
     return invoke("sync_session_usage");
+  },
+
+  /** 会话日志扫描（后台定时或手动同步）最近一次完成的时间（毫秒）；本次启动后还没扫过时为 null */
+  getSessionUsageLastSync: async (): Promise<number | null> => {
+    return invoke("get_session_usage_last_sync");
   },
 
   rebuildCodexUsage: async (): Promise<SessionSyncResult> => {

@@ -74,7 +74,8 @@ describe("useDirectorySettings", () => {
       if (app === "openclaw") return "/remote/openclaw";
       if (app === "hermes") return "/remote/hermes";
       if (app === "kimicode") return "/remote/kimicode";
-      return "/remote/unknown";
+      if (app === "pi") return "/remote/pi";
+      return "/remote/hermes";
     });
     selectConfigDirectoryMock.mockReset();
   });
@@ -99,6 +100,7 @@ describe("useDirectorySettings", () => {
       openclaw: "/remote/openclaw",
       hermes: "/remote/hermes",
       kimicode: "/remote/kimicode",
+      pi: "/remote/pi",
     });
   });
 
@@ -169,6 +171,27 @@ describe("useDirectorySettings", () => {
     expect(onUpdateSettings).not.toHaveBeenCalledWith({
       codexConfigDir: expect.anything(),
     });
+  });
+
+  it("moves the saved baseline when a new app config dir is committed", async () => {
+    getAppConfigDirOverrideMock.mockResolvedValue("/override/app");
+    const { result } = renderHook(() =>
+      useDirectorySettings({
+        settings: createSettings(),
+        onUpdateSettings: vi.fn(),
+      }),
+    );
+    await waitFor(() =>
+      expect(result.current.initialAppConfigDir).toBe("/override/app"),
+    );
+
+    act(() => result.current.commitAppConfigDir("/saved/app"));
+    expect(result.current.initialAppConfigDir).toBe("/saved/app");
+
+    // 重置回的也是新基准
+    act(() => result.current.updateAppConfigDir("/typed/app"));
+    act(() => result.current.resetAllDirectories());
+    expect(result.current.appConfigDir).toBe("/saved/app");
   });
 
   it("updates app config directory via browseAppConfigDir", async () => {

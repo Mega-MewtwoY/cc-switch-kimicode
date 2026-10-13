@@ -25,7 +25,10 @@ pub fn import_from_kimicode(config: &mut MultiAppConfig) -> Result<usize, AppErr
         return Ok(0);
     };
 
-    let servers = config.mcp.servers.get_or_insert_with(std::collections::HashMap::new);
+    let servers = config
+        .mcp
+        .servers
+        .get_or_insert_with(std::collections::HashMap::new);
 
     let mut changed = 0;
     let mut errors = Vec::new();

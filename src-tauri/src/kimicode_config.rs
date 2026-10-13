@@ -61,7 +61,11 @@ pub fn get_kimicode_config_path() -> PathBuf {
 /// 注意：本函数不做过期检查与续期；调用方应优先使用
 /// [`load_or_refresh_oauth_access_token`]。
 pub fn load_oauth_access_token() -> Option<String> {
-    load_oauth_access_token_from(&get_kimicode_dir().join("credentials").join("kimi-code.json"))
+    load_oauth_access_token_from(
+        &get_kimicode_dir()
+            .join("credentials")
+            .join("kimi-code.json"),
+    )
 }
 
 fn load_oauth_access_token_from(path: &Path) -> Option<String> {
@@ -89,8 +93,15 @@ pub const KIMI_OAUTH_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 /// 距过期不足该秒数即触发续期
 const OAUTH_REFRESH_SKEW_SECS: i64 = 60;
 
+/// Kimi Work&Chat 启动条目的固定供应商 ID。
+/// 该条目只存在于 CC Switch 数据库中（live_config_managed=false），
+/// 永不写入 config.toml，仅供卡片"打开"按钮直接启动 Kimi.app。
+pub const KIMI_APP_LAUNCHER_ID: &str = "managed:kimi-app";
+
 fn oauth_credentials_path() -> PathBuf {
-    get_kimicode_dir().join("credentials").join("kimi-code.json")
+    get_kimicode_dir()
+        .join("credentials")
+        .join("kimi-code.json")
 }
 
 fn now_epoch_secs() -> i64 {
@@ -117,10 +128,7 @@ pub async fn load_or_refresh_oauth_access_token() -> Option<String> {
     load_or_refresh_oauth_access_token_from(&oauth_credentials_path(), KIMI_OAUTH_TOKEN_URL).await
 }
 
-async fn load_or_refresh_oauth_access_token_from(
-    path: &Path,
-    token_url: &str,
-) -> Option<String> {
+async fn load_or_refresh_oauth_access_token_from(path: &Path, token_url: &str) -> Option<String> {
     let original_content = std::fs::read_to_string(path).ok()?;
     let mut value: Value = serde_json::from_str(&original_content).ok()?;
     let access_token = value.get("access_token")?.as_str()?.to_string();
@@ -172,7 +180,10 @@ async fn load_or_refresh_oauth_access_token_from(
     if let Some(rt) = body.get("refresh_token").and_then(Value::as_str) {
         value["refresh_token"] = Value::String(rt.to_string());
     }
-    let expires_in = body.get("expires_in").and_then(Value::as_i64).unwrap_or(900);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .unwrap_or(900);
     value["access_token"] = Value::String(new_access.clone());
     value["expires_in"] = Value::from(expires_in);
     value["expires_at"] = Value::from(now_epoch_secs() + expires_in);
@@ -294,11 +305,9 @@ fn toml_item_to_json(item: &Item) -> Value {
         Item::None => Value::Null,
         Item::Value(v) => toml_value_to_json(v),
         Item::Table(t) => toml_table_to_json(t.iter()),
-        Item::ArrayOfTables(arr) => Value::Array(
-            arr.iter()
-                .map(|t| toml_table_to_json(t.iter()))
-                .collect(),
-        ),
+        Item::ArrayOfTables(arr) => {
+            Value::Array(arr.iter().map(|t| toml_table_to_json(t.iter())).collect())
+        }
     }
 }
 
@@ -321,6 +330,26 @@ fn qualify_model_key(provider_id: &str, alias: &str) -> String {
     } else {
         format!("{provider_id}/{alias}")
     }
+}
+
+/// 切换前校验默认模型，避免把空值或不存在的别名写入 live config。
+pub fn default_model_key_for(
+    provider_id: &str,
+    config: &KimiCodeProviderConfig,
+) -> Result<String, AppError> {
+    let alias = config
+        .default_model
+        .as_deref()
+        .filter(|alias| !alias.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::Config(format!("Kimi Code 供应商 '{provider_id}' 未设置默认模型"))
+        })?;
+    if !config.models.contains_key(alias) {
+        return Err(AppError::Config(format!(
+            "Kimi Code 供应商 '{provider_id}' 的默认模型 '{alias}' 不在模型列表中"
+        )));
+    }
+    Ok(qualify_model_key(provider_id, alias))
 }
 
 /// config.toml 模型键 → cc-switch 侧别名：剥离 `<provider_id>/` 前缀（若有）。
@@ -387,11 +416,13 @@ pub fn get_providers() -> Result<IndexMap<String, KimiCodeProviderConfig>, AppEr
             }
         }
 
-        let provider_default = default_model.and_then(|dm| {
-            let alias = strip_model_key_prefix(provider_id, dm);
-            // default_model 必须确实指向该供应商的某个模型
-            models.contains_key(alias).then(|| alias.to_string())
-        });
+        let provider_default = default_model
+            .and_then(|dm| {
+                let alias = strip_model_key_prefix(provider_id, dm);
+                // default_model 必须确实指向该供应商的某个模型
+                models.contains_key(alias).then(|| alias.to_string())
+            })
+            .or_else(|| models.keys().min().cloned());
 
         result.insert(
             provider_id.to_string(),
@@ -412,6 +443,22 @@ pub fn set_provider(id: &str, config: &KimiCodeProviderConfig) -> Result<(), App
     let _guard = kimicode_config_lock().lock()?;
     let path = get_kimicode_config_path();
     let mut doc = read_kimicode_config_from_path(&path)?;
+    let requested_default = config
+        .default_model
+        .as_ref()
+        .map(|_| default_model_key_for(id, config))
+        .transpose()?;
+    let previous_active_model = doc
+        .get("default_model")
+        .and_then(Item::as_str)
+        .and_then(|key| {
+            (doc.get("models")
+                .and_then(|models| models.get(key))
+                .and_then(|model| model.get("provider"))
+                .and_then(Item::as_str)
+                == Some(id))
+            .then(|| key.to_string())
+        });
 
     // providers 段是投影区之一，但 thinking/services 等用户自有配置必须保留，
     // 因此只在 doc 上定点修改，绝不整体重写。
@@ -445,12 +492,16 @@ pub fn set_provider(id: &str, config: &KimiCodeProviderConfig) -> Result<(), App
         .keys()
         .map(|alias| qualify_model_key(id, alias))
         .collect();
+    if previous_active_model.is_some() && requested_default.is_none() {
+        return Err(AppError::Config(format!(
+            "Kimi Code 供应商 '{id}' 正在使用中，请指定有效的默认模型"
+        )));
+    }
     if let Some(t) = doc.get_mut("models").and_then(Item::as_table_mut) {
         let stale_keys: Vec<String> = t
             .iter()
             .filter(|(key, item)| {
-                item.get("provider").and_then(Item::as_str) == Some(id)
-                    && !new_keys.contains(*key)
+                item.get("provider").and_then(Item::as_str) == Some(id) && !new_keys.contains(*key)
             })
             .map(|(key, _)| key.to_string())
             .collect();
@@ -462,8 +513,8 @@ pub fn set_provider(id: &str, config: &KimiCodeProviderConfig) -> Result<(), App
     // 3. 写入模型表（附带 provider 归属指针）
     for (alias, model) in &config.models {
         let key = qualify_model_key(id, alias);
-        let mut model_value = serde_json::to_value(model)
-            .map_err(|e| AppError::JsonSerialize { source: e })?;
+        let mut model_value =
+            serde_json::to_value(model).map_err(|e| AppError::JsonSerialize { source: e })?;
         if let Value::Object(ref mut obj) = model_value {
             obj.insert("provider".to_string(), Value::String(id.to_string()));
         }
@@ -471,6 +522,12 @@ pub fn set_provider(id: &str, config: &KimiCodeProviderConfig) -> Result<(), App
             if let Some(t) = doc.get_mut("models").and_then(Item::as_table_mut) {
                 t.insert(&key, item);
             }
+        }
+    }
+
+    if previous_active_model.is_some() {
+        if let Some(default_key) = requested_default {
+            doc["default_model"] = toml_edit::value(default_key);
         }
     }
 
@@ -533,7 +590,25 @@ pub fn set_default_model(model_key: &str) -> Result<(), AppError> {
 
 /// 把 default_model 指向指定供应商的某个模型别名（自动补全限定前缀）
 pub fn set_default_model_for(provider_id: &str, alias: &str) -> Result<(), AppError> {
-    set_default_model(&qualify_model_key(provider_id, alias))
+    if alias.trim().is_empty() {
+        return Err(AppError::Config("Kimi Code 默认模型不能为空".to_string()));
+    }
+    let _guard = kimicode_config_lock().lock()?;
+    let path = get_kimicode_config_path();
+    let mut doc = read_kimicode_config_from_path(&path)?;
+    let key = qualify_model_key(provider_id, alias);
+    let owner = doc
+        .get("models")
+        .and_then(|models| models.get(&key))
+        .and_then(|model| model.get("provider"))
+        .and_then(Item::as_str);
+    if owner != Some(provider_id) {
+        return Err(AppError::Config(format!(
+            "Kimi Code 默认模型 '{key}' 不属于供应商 '{provider_id}'"
+        )));
+    }
+    doc["default_model"] = toml_edit::value(key);
+    write_kimicode_config_to_path(&path, &doc)
 }
 
 /// 从 live 配置推断「当前供应商 id」：default_model 指向的模型属于哪个供应商。
@@ -622,7 +697,12 @@ mod tests {
             config.models.contains_key("kimi-k2.6"),
             "model alias must be stripped of the provider prefix"
         );
-        assert!(config.default_model.is_none(), "default_model 不应由 set_provider 设置");
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("kimi-k2.6"),
+            "未激活的 live 供应商也应有可切换的默认模型"
+        );
+        assert_eq!(get_default_model().expect("live default"), None);
 
         set_default_model("my-proxy/kimi-k2.6").expect("set default model");
         let providers = get_providers().expect("reload");
@@ -691,6 +771,47 @@ enabled = true
             None,
             "悬空的 default_model 必须被清除"
         );
+    }
+
+    #[test]
+    fn rejects_empty_or_missing_default_model() {
+        let mut config = sample_provider();
+        config.default_model = Some(String::new());
+        assert!(default_model_key_for("my-proxy", &config).is_err());
+
+        config.default_model = Some("does-not-exist".to_string());
+        assert!(default_model_key_for("my-proxy", &config).is_err());
+
+        config.default_model = None;
+        assert!(default_model_key_for("my-proxy", &config).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn set_provider_moves_active_default_when_model_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = TestHomeGuard::set(temp.path());
+
+        set_provider("my-proxy", &sample_provider()).expect("set provider");
+        set_default_model_for("my-proxy", "kimi-k2.6").expect("activate model");
+
+        let mut updated = sample_provider();
+        let model = updated.models.remove("kimi-k2.6").expect("sample model");
+        updated.models.insert("new-model".to_string(), model);
+        updated.default_model = None;
+        assert!(set_provider("my-proxy", &updated).is_err());
+        assert_eq!(
+            get_default_model().unwrap().as_deref(),
+            Some("my-proxy/kimi-k2.6")
+        );
+
+        updated.default_model = Some("new-model".to_string());
+        set_provider("my-proxy", &updated).expect("update active provider");
+        assert_eq!(
+            get_default_model().unwrap().as_deref(),
+            Some("my-proxy/new-model")
+        );
+        assert!(set_default_model_for("my-proxy", "missing").is_err());
     }
 
     #[test]

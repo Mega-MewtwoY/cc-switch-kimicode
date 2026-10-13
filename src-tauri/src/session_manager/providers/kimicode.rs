@@ -106,8 +106,8 @@ fn parse_session(session_dir: &Path) -> Option<SessionMeta> {
 /// source_path 是会话目录；读取其中所有 agent 的 wire.jsonl
 pub fn load_messages(source_dir: &Path) -> Result<Vec<SessionMessage>, String> {
     let agents_dir = source_dir.join("agents");
-    let entries = std::fs::read_dir(&agents_dir)
-        .map_err(|e| format!("Failed to read agents dir: {e}"))?;
+    let entries =
+        std::fs::read_dir(&agents_dir).map_err(|e| format!("Failed to read agents dir: {e}"))?;
 
     let mut result = Vec::new();
     for entry in entries.flatten() {
@@ -163,6 +163,7 @@ fn parse_wire_line(line: &str) -> Option<SessionMessage> {
                 role: "user".to_string(),
                 content,
                 ts: value.get("time").and_then(Value::as_i64),
+                ..Default::default()
             })
         }
         // 助手事件（嵌套在 loop_event 内）
@@ -183,6 +184,7 @@ fn parse_wire_line(line: &str) -> Option<SessionMessage> {
                         role: "assistant".to_string(),
                         content,
                         ts,
+                        ..Default::default()
                     })
                 }
                 Some("tool.call") => {
@@ -191,6 +193,7 @@ fn parse_wire_line(line: &str) -> Option<SessionMessage> {
                         role: "assistant".to_string(),
                         content: format!("[Tool: {name}]"),
                         ts,
+                        ..Default::default()
                     })
                 }
                 _ => None,
@@ -261,9 +264,7 @@ mod tests {
     #[test]
     fn skips_non_message_events() {
         assert!(parse_wire_line(r#"{"type":"metadata","protocol_version":"1.5"}"#).is_none());
-        assert!(
-            parse_wire_line(r#"{"type":"usage.record","usageScope":"turn"}"#).is_none()
-        );
+        assert!(parse_wire_line(r#"{"type":"usage.record","usageScope":"turn"}"#).is_none());
         // think 片段不展示
         assert!(parse_wire_line(
             r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","think":"…"}},"time":1}"#

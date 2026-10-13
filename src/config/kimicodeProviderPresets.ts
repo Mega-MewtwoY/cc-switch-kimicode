@@ -1,7 +1,9 @@
 import type { ProviderCategory, KimiCodeProviderConfig } from "../types";
 import type { PresetTheme, TemplateValueConfig } from "./claudeProviderPresets";
 
-export interface KimiCodeProviderPreset {
+import type { PresetFamilyFields } from "./presetFamilies";
+
+export interface KimiCodeProviderPreset extends PresetFamilyFields {
   name: string;
   nameKey?: string;
   websiteUrl: string;

@@ -5,7 +5,8 @@ use crate::app_config::AppType;
 use crate::commands::copilot::CopilotAuthState;
 use crate::commands::xai_oauth::XaiOAuthState;
 use crate::error::AppError;
-use crate::provider::{ClaudeDesktopMode, Provider};
+use crate::provider::{ClaudeDesktopMode, Provider, ProviderMeta};
+use crate::services::provider::{EditorSave, EditorView};
 use crate::services::{
     EndpointLatency, ProviderService, ProviderSortUpdate, SpeedtestService, SwitchResult,
 };
@@ -15,6 +16,55 @@ use std::str::FromStr;
 // 常量定义
 const TEMPLATE_TYPE_GITHUB_COPILOT: &str = "github_copilot";
 const TEMPLATE_TYPE_TOKEN_PLAN: &str = "token_plan";
+
+/// 确保"Kimi 桌面端启动"条目存在（仅 UI 列表路径调用，失败只记日志）。
+/// 该条目 DB 独有、live_config_managed=false，永不写入 config.toml。
+fn ensure_kimi_app_launcher_entry(state: &AppState) {
+    use crate::kimicode_config::KIMI_APP_LAUNCHER_ID;
+    match state
+        .db
+        .get_provider_by_id(KIMI_APP_LAUNCHER_ID, "kimicode")
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let mut provider = Provider::with_id(
+                KIMI_APP_LAUNCHER_ID.to_string(),
+                "Kimi Work&Chat".to_string(),
+                serde_json::json!({ "launcher": true }),
+                Some("https://www.kimi.com".to_string()),
+            );
+            provider.category = Some("official".to_string());
+            provider.icon = Some("kimicode".to_string());
+            provider.icon_color = Some("#4F46E5".to_string());
+            let meta = provider.meta.get_or_insert_with(Default::default);
+            meta.live_config_managed = Some(false);
+            // 与官方条目相同的用量元数据：实际查询在命令层委托给
+            // managed:kimi-code（同一 OAuth 通道），这里只保证卡片页脚
+            // 显示相同的 5 小时/7 天用量内容。
+            meta.usage_script = Some(crate::provider::UsageScript {
+                enabled: true,
+                language: "javascript".to_string(),
+                code: String::new(),
+                timeout: Some(10),
+                api_key: None,
+                base_url: None,
+                access_token: None,
+                user_id: None,
+                template_type: Some("token_plan".to_string()),
+                auto_query_interval: Some(5),
+                coding_plan_provider: Some("kimi".to_string()),
+                access_key_id: None,
+                secret_access_key: None,
+                team_organization_id: None,
+                team_project_id: None,
+            });
+            if let Err(e) = state.db.save_provider("kimicode", &provider) {
+                log::warn!("Failed to seed Kimi App launcher entry: {e}");
+            }
+        }
+        Err(e) => log::warn!("Failed to look up Kimi App launcher entry: {e}"),
+    }
+}
 const TEMPLATE_TYPE_BALANCE: &str = "balance";
 const TEMPLATE_TYPE_OFFICIAL_SUBSCRIPTION: &str = "official_subscription";
 const COPILOT_UNIT_PREMIUM: &str = "requests";
@@ -25,38 +75,132 @@ pub fn get_providers(
     state: State<'_, AppState>,
     app: String,
 ) -> Result<IndexMap<String, Provider>, String> {
+    if app == "doubao" {
+        return crate::commands::doubao::list_providers(state.inner());
+    }
+    if app == "kimicode" {
+        ensure_kimi_app_launcher_entry(state.inner());
+    }
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     ProviderService::list(state.inner(), app_type).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<String, String> {
+    if app == "doubao" {
+        return crate::commands::doubao::current_provider(state.inner());
+    }
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     ProviderService::current(state.inner(), app_type).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn add_provider(
-    state: State<'_, AppState>,
+pub async fn add_provider(
+    app_handle: tauri::AppHandle,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] addToLive: Option<bool>,
+    #[allow(non_snake_case)] editorSave: Option<EditorSave>,
 ) -> Result<bool, String> {
+    if app == "doubao" {
+        return tauri::async_runtime::spawn_blocking(move || {
+            let state = app_handle
+                .try_state::<AppState>()
+                .ok_or_else(|| "应用状态不可用".to_string())?;
+            crate::commands::doubao::doubao_add_provider(state.inner(), provider)
+        })
+        .await
+        .map_err(|e| format!("豆包供应商添加任务执行失败: {e}"))?;
+    }
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::add(state.inner(), app_type, provider, addToLive.unwrap_or(true))
-        .map_err(|e| e.to_string())
+    let add_to_live = addToLive.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        ProviderService::add_from_editor(state.inner(), app_type, provider, add_to_live, editorSave)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("供应商添加任务执行失败: {e}"))?
 }
 
 #[tauri::command]
-pub fn update_provider(
-    state: State<'_, AppState>,
+pub async fn update_provider(
+    app_handle: tauri::AppHandle,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
+    #[allow(non_snake_case)] editorSave: Option<EditorSave>,
 ) -> Result<bool, String> {
+    if app == "doubao" {
+        return tauri::async_runtime::spawn_blocking(move || {
+            let state = app_handle
+                .try_state::<AppState>()
+                .ok_or_else(|| "应用状态不可用".to_string())?;
+            crate::commands::doubao::doubao_update_provider(
+                state.inner(),
+                originalId.as_deref(),
+                provider,
+            )
+        })
+        .await
+        .map_err(|e| format!("豆包供应商更新任务执行失败: {e}"))?;
+    }
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::update(state.inner(), app_type, originalId.as_deref(), provider)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        ProviderService::update_from_editor(
+            state.inner(),
+            app_type,
+            originalId.as_deref(),
+            provider,
+            editorSave,
+        )
         .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("供应商更新任务执行失败: {e}"))?
+}
+
+/// 供应商编辑器底部 JSON 的显示内容：切到这个供应商之后配置文件会是什么样。
+/// `settingsConfig` 是供应商的行（新增时传空对象）。
+/// Codex draft metadata wins over the stored provider's metadata when supplied.
+#[tauri::command]
+pub async fn get_provider_editor_view(
+    app_handle: tauri::AppHandle,
+    app: String,
+    #[allow(non_snake_case)] settingsConfig: serde_json::Value,
+    category: Option<String>,
+    #[allow(non_snake_case)] providerId: Option<String>,
+    meta: Option<ProviderMeta>,
+) -> Result<EditorView, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        let category = ProviderService::editor_category(
+            state.inner(),
+            &app_type,
+            providerId.as_deref(),
+            category,
+        )
+        .map_err(|e| e.to_string())?;
+        ProviderService::editor_view_with_meta(
+            state.inner(),
+            app_type,
+            &settingsConfig,
+            category.as_deref(),
+            providerId.as_deref(),
+            meta.as_ref(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("读取编辑器内容失败: {e}"))?
 }
 
 #[tauri::command]
@@ -65,6 +209,9 @@ pub fn delete_provider(
     app: String,
     id: String,
 ) -> Result<bool, String> {
+    if app == "doubao" {
+        return crate::commands::doubao::doubao_delete_provider(state.inner(), &id);
+    }
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     ProviderService::delete(state.inner(), app_type, &id)
         .map(|_| true)
@@ -106,15 +253,41 @@ pub async fn switch_provider(
     app: String,
     id: String,
 ) -> Result<SwitchResult, String> {
+    if app == "doubao" {
+        return tauri::async_runtime::spawn_blocking(move || {
+            let state = app_handle
+                .try_state::<AppState>()
+                .ok_or_else(|| "应用状态不可用".to_string())?;
+            crate::commands::doubao::doubao_switch_provider(state.inner(), &id)
+        })
+        .await
+        .map_err(|e| format!("豆包默认账号切换任务执行失败: {e}"))?;
+    }
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle
+    let is_desktop = matches!(app_type, AppType::ClaudeDesktop);
+    let desktop_was_mapping = is_desktop
+        && app_handle.try_state::<AppState>().is_some_and(|state| {
+            crate::claude_desktop_config::current_provider_uses_proxy(&state.db)
+        });
+    let handle = app_handle.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = handle
             .try_state::<AppState>()
             .ok_or_else(|| "应用状态不可用".to_string())?;
         switch_provider_internal(state.inner(), app_type, &id).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("供应商切换任务执行失败: {e}"))?
+    .map_err(|e| format!("供应商切换任务执行失败: {e}"))??;
+    if is_desktop {
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            crate::mode::controller::sync_desktop_mapping_service(
+                state.inner(),
+                desktop_was_mapping,
+            )
+            .await;
+        }
+    }
+    Ok(result)
 }
 
 fn import_default_config_internal(state: &AppState, app_type: AppType) -> Result<bool, AppError> {
@@ -538,7 +711,17 @@ async fn query_provider_usage_inner(
         .db
         .get_all_providers(app_type.as_str())
         .map_err(|e| format!("Failed to get providers: {e}"))?;
-    let provider = providers.get(provider_id);
+    // Kimi App 启动条目自身不携带凭据：完全复用官方条目（managed:kimi-code）
+    // 的 token_plan 通道、base_url 与 OAuth 令牌回退，查询结果一致。
+    let effective_provider_id = if app_type == AppType::KimiCode
+        && provider_id == crate::kimicode_config::KIMI_APP_LAUNCHER_ID
+        && providers.contains_key("managed:kimi-code")
+    {
+        "managed:kimi-code"
+    } else {
+        provider_id
+    };
+    let provider = providers.get(effective_provider_id);
     let usage_script = provider
         .and_then(|p| p.meta.as_ref())
         .and_then(|m| m.usage_script.as_ref());
@@ -843,14 +1026,22 @@ pub fn update_endpoint_last_used(
         .map_err(|e| e.to_string())
 }
 
+/// 排序就是故障转移队列的优先级，托盘按它列队列：改完重建托盘。
 #[tauri::command]
 pub fn update_providers_sort_order(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     app: String,
     updates: Vec<ProviderSortUpdate>,
 ) -> Result<bool, String> {
+    if app == "doubao" {
+        return crate::commands::doubao::doubao_update_sort_order(state.inner(), updates);
+    }
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::update_sort_order(state.inner(), app_type, updates).map_err(|e| e.to_string())
+    let changed = ProviderService::update_sort_order(state.inner(), app_type, updates)
+        .map_err(|e| e.to_string())?;
+    crate::tray::refresh_tray_menu(&app_handle);
+    Ok(changed)
 }
 
 use crate::provider::UniversalProvider;

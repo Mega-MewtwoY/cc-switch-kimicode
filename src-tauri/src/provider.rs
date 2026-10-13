@@ -87,6 +87,16 @@ impl Provider {
             || self.claude_base_url_contains("chatgpt.com/backend-api/codex")
     }
 
+    /// Third-party managed OAuth (xai_oauth, github_copilot, …): the real
+    /// credential is injected per-request by the local proxy, so the card is
+    /// keyless by design and its stored config is only an upstream snapshot.
+    /// `codex_oauth` is deliberately excluded — the official ChatGPT login
+    /// in auth.json IS its credential, so the `requires_openai_auth = true`
+    /// fallback is its correct shape, never a legacy leftover.
+    pub fn uses_proxy_injected_oauth(&self) -> bool {
+        self.is_xai_oauth() || self.is_github_copilot()
+    }
+
     /// Whether the provider form's "auth field" was explicitly set to
     /// ANTHROPIC_API_KEY. The form only persists `meta.apiKeyField` for the
     /// non-default choice, so `None` means the default ANTHROPIC_AUTH_TOKEN.
@@ -100,6 +110,11 @@ impl Provider {
 
     fn provider_type(&self) -> Option<&str> {
         self.meta.as_ref().and_then(|m| m.provider_type.as_deref())
+    }
+
+    /// The stored OpenCode source format; only native declarations record one.
+    pub fn opencode_config_format(&self) -> Option<OpenCodeConfigFormat> {
+        self.meta.as_ref().and_then(|m| m.opencode_config_format)
     }
 
     fn claude_base_url_contains(&self, needle: &str) -> bool {
@@ -207,22 +222,54 @@ impl Provider {
                 str_at(settings.get("baseUrl")),
                 str_at(settings.get("apiKey")),
             ),
+            // Pi custom providers use the native models.json field names.
+            AppType::Pi => (
+                crate::pi_config::provider_base_url(settings).unwrap_or_default(),
+                str_at(settings.get("apiKey")),
+            ),
             // OpenCode (OMO) nests credentials under `options` (the SDK options object).
-            AppType::OpenCode => {
+            AppType::OpenCode | AppType::Mcode => {
                 let options = settings.get("options");
                 (
                     str_at(options.and_then(|o| o.get("baseURL"))),
                     str_at(options.and_then(|o| o.get("apiKey"))),
                 )
             }
-            // Kimi Code nests credentials under `provider`（snake_case，与 config.toml 一致）。
+            // Kimi Code 有两种存储形态：
+            // - 预设/表单写入的单供应商形态：`provider.{base_url, api_key}`
+            // - 从 live config.toml 导入的整文档形态（官方 managed:kimi-code 即此形态）：
+            //   凭据在 `providers.<供应商id>` 下，键不匹配时经
+            //   `models[default_model].provider` 指针定位，单条目 map 直接取用
             AppType::KimiCode => {
-                let provider = settings.get("provider");
+                let from_map = settings
+                    .get("providers")
+                    .and_then(Value::as_object)
+                    .and_then(|map| {
+                        map.get(&self.id)
+                            .or_else(|| {
+                                settings
+                                    .get("default_model")
+                                    .and_then(Value::as_str)
+                                    .and_then(|m| settings.get("models").and_then(|ms| ms.get(m)))
+                                    .and_then(|m| m.get("provider"))
+                                    .and_then(Value::as_str)
+                                    .and_then(|id| map.get(id))
+                            })
+                            .or_else(|| {
+                                if map.len() == 1 {
+                                    map.values().next()
+                                } else {
+                                    None
+                                }
+                            })
+                    });
+                let node = from_map.or_else(|| settings.get("provider"));
                 (
-                    str_at(provider.and_then(|p| p.get("base_url"))),
-                    str_at(provider.and_then(|p| p.get("api_key"))),
+                    str_at(node.and_then(|p| p.get("base_url"))),
+                    str_at(node.and_then(|p| p.get("api_key"))),
                 )
             }
+
             // Claude and Claude Desktop both use the Anthropic-style env map, keeping
             // the OpenRouter/Google key fallbacks the JS-script path relies on.
             // Listed explicitly (not `_`) so a new AppType fails to compile here.
@@ -391,6 +438,29 @@ pub struct ClaudeDesktopModelRoute {
     pub supports_1m: Option<bool>,
 }
 
+/// Codex Copilot protocol selection; independent of legacy `apiFormat` metadata.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexCopilotApiFormat {
+    #[default]
+    Auto,
+    OpenaiResponses,
+    OpenaiChat,
+}
+
+impl CodexCopilotApiFormat {
+    /// Read the stored selection. The meta field stays a plain string so a value
+    /// written by a newer version survives sync round-trips here instead of
+    /// failing the whole `ProviderMeta` parse; unknown values fall back to auto.
+    pub fn from_meta(meta: Option<&ProviderMeta>) -> Self {
+        match meta.and_then(|meta| meta.codex_copilot_api_format.as_deref()) {
+            Some("openai_responses") => Self::OpenaiResponses,
+            Some("openai_chat") => Self::OpenaiChat,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Codex Responses -> Chat Completions 的 reasoning 能力描述。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CodexChatReasoningConfig {
@@ -409,6 +479,12 @@ pub struct CodexChatReasoningConfig {
     /// 靠穷举字段提取、并不读取本字段；保留作文档说明与未来按格式分发（如 think_tags）的预留。
     #[serde(rename = "outputFormat", skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
+    /// 运行时字段（不持久化、不进 meta）：当前请求模型在平台侧声明的合法 effort
+    /// 档位，由 resolve 按请求模型从供应商 `settings_config.modelCatalog` 的
+    /// `reasoningLevels`（逐模型声明，见 #6228）查表填充。仅 "zen" 值映射消费：
+    /// Some → 钳到合法档；None → 不发 effort 字段（模型未收录或为 toggle 型）。
+    #[serde(skip)]
+    pub effort_levels: Option<Vec<String>>,
 }
 
 /// Local proxy request overrides applied after route/protocol transforms.
@@ -463,10 +539,11 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub partner_promotion_key: Option<String>,
-    /// 成本倍数（用于计算实际成本）
+    /// 已停用：供应商级成本倍率。新版不再读取，只为与旧版设备同步时原样往返保留
     #[serde(rename = "costMultiplier", skip_serializing_if = "Option::is_none")]
     pub cost_multiplier: Option<String>,
-    /// 计费模式来源（response/request）
+    /// 已停用：供应商级计费模式覆盖（response/request）。新版只读全局设置，
+    /// 该字段只为与旧版设备同步时原样往返保留
     #[serde(rename = "pricingModelSource", skip_serializing_if = "Option::is_none")]
     pub pricing_model_source: Option<String>,
     /// 每日消费限额（USD）
@@ -481,6 +558,13 @@ pub struct ProviderMeta {
     /// - "openai_responses": OpenAI Responses API 格式，需要转换
     #[serde(rename = "apiFormat", skip_serializing_if = "Option::is_none")]
     pub api_format: Option<String>,
+    /// Codex Copilot only: absent or auto prefers advertised Responses, then Chat.
+    /// Legacy `apiFormat` does not imply an explicit Copilot protocol override.
+    #[serde(
+        rename = "codexCopilotApiFormat",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_copilot_api_format: Option<String>,
     /// 通用认证绑定（provider_config / managed_account）
     ///
     /// 新代码应只写入该字段；githubAccountId 仅保留兼容读取。
@@ -541,6 +625,13 @@ pub struct ProviderMeta {
     /// `None` 表示旧数据/未知状态，`Some(false)` 表示明确仅存在于数据库中。
     #[serde(rename = "liveConfigManaged", skip_serializing_if = "Option::is_none")]
     pub live_config_managed: Option<bool>,
+    /// Source format for OpenCode entries whose fields alone are ambiguous
+    /// (for example, a native V2 built-in provider containing only models).
+    #[serde(
+        rename = "opencodeConfigFormat",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub opencode_config_format: Option<OpenCodeConfigFormat>,
     /// 供应商类型标识（用于特殊供应商检测）
     /// - "github_copilot": GitHub Copilot 供应商
     #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
@@ -549,6 +640,28 @@ pub struct ProviderMeta {
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
+    /// Stack 模式下这家 Claude Code 供应商发布的模型（`mode::stack`）。`None` 是没配列表，
+    /// 按模型映射（`ANTHROPIC_MODEL` 和各档）发布；空列表是用户清空了，什么都不发布。
+    #[serde(
+        rename = "stackModels",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stack_models: Option<Vec<ClaudeStackModel>>,
+}
+
+/// Stack 模式下 Claude Code 供应商发布的一个模型。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeStackModel {
+    /// 发往上游的模型名。
+    pub model: String,
+    /// 选择器里的显示名，没有时用模型名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// 上游是 1M 窗口。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_m: bool,
 }
 
 /// 解析 Provider 级自定义 User-Agent 字符串（单一真理来源）。
@@ -907,6 +1020,13 @@ requires_openai_auth = true"#
 // OpenCode 供应商配置结构
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenCodeConfigFormat {
+    V1,
+    V2,
+}
+
 /// OpenCode 供应商的 settings_config 结构
 ///
 /// OpenCode 使用 AI SDK 包名来指定供应商类型，与其他应用的配置格式不同。
@@ -921,6 +1041,8 @@ requires_openai_auth = true"#
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeProviderConfig {
     /// AI SDK 包名，如 "@ai-sdk/openai-compatible", "@ai-sdk/anthropic"
+    /// 内置供应商可以省略，沿用 OpenCode 的包和模型定义。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub npm: String,
 
     /// 供应商名称（可选，用于显示）
@@ -972,6 +1094,7 @@ pub struct OpenCodeProviderOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeModel {
     /// 模型显示名称
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
 
     /// 模型限制（上下文和输出 token 数）
@@ -1101,11 +1224,36 @@ pub struct KimiCodeModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        ClaudeModelConfig, CodexCopilotApiFormat, CodexModelConfig, GeminiModelConfig,
+        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderManager,
+        ProviderMeta, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn proxy_injected_oauth_excludes_codex_oauth() {
+        let mut provider = Provider::with_id("p".to_string(), "P".to_string(), json!({}), None);
+        assert!(!provider.uses_proxy_injected_oauth());
+
+        for (provider_type, expected) in [
+            ("xai_oauth", true),
+            ("github_copilot", true),
+            // the official ChatGPT login IS this card's credential — its
+            // auth.json fallback shape must never be neutralized
+            ("codex_oauth", false),
+        ] {
+            provider.meta = Some(ProviderMeta {
+                provider_type: Some(provider_type.to_string()),
+                ..ProviderMeta::default()
+            });
+            assert_eq!(
+                provider.uses_proxy_injected_oauth(),
+                expected,
+                "{provider_type}"
+            );
+        }
+    }
 
     #[test]
     fn provider_meta_serializes_pricing_model_source() {
@@ -1155,6 +1303,65 @@ mod tests {
     fn provider_meta_omits_max_output_tokens_when_none() {
         let value = serde_json::to_value(ProviderMeta::default()).expect("serialize ProviderMeta");
         assert!(value.get("maxOutputTokens").is_none());
+    }
+
+    #[test]
+    fn codex_copilot_api_format_roundtrips_supported_values() {
+        for (wire, expected) in [
+            ("auto", CodexCopilotApiFormat::Auto),
+            ("openai_responses", CodexCopilotApiFormat::OpenaiResponses),
+            ("openai_chat", CodexCopilotApiFormat::OpenaiChat),
+        ] {
+            let value = json!({
+                "apiFormat": "openai_chat",
+                "codexCopilotApiFormat": wire
+            });
+            let meta: ProviderMeta = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(CodexCopilotApiFormat::from_meta(Some(&meta)), expected);
+            assert_eq!(meta.api_format.as_deref(), Some("openai_chat"));
+            assert_eq!(serde_json::to_value(meta).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn codex_copilot_api_format_preserves_legacy_absence() {
+        for value in [
+            json!({}),
+            json!({"apiFormat": "openai_chat"}),
+            json!({"apiFormat": "openai_responses"}),
+        ] {
+            let meta: ProviderMeta = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(meta.codex_copilot_api_format, None);
+            assert_eq!(
+                CodexCopilotApiFormat::from_meta(Some(&meta)),
+                CodexCopilotApiFormat::Auto
+            );
+            assert_eq!(serde_json::to_value(meta).unwrap(), value);
+        }
+        assert_eq!(
+            CodexCopilotApiFormat::from_meta(None),
+            CodexCopilotApiFormat::Auto
+        );
+    }
+
+    /// A value from a newer version must not fail the whole meta parse (the DAO
+    /// would fall back to an empty meta and drop the account binding); it is read
+    /// as auto and written back unchanged.
+    #[test]
+    fn codex_copilot_api_format_keeps_unknown_values_without_losing_meta() {
+        for wire in ["anthropic", "messages", "openai", "unknown", ""] {
+            let value = json!({
+                "providerType": "github_copilot",
+                "codexCopilotApiFormat": wire
+            });
+            let meta: ProviderMeta = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(meta.provider_type.as_deref(), Some("github_copilot"));
+            assert_eq!(
+                CodexCopilotApiFormat::from_meta(Some(&meta)),
+                CodexCopilotApiFormat::Auto
+            );
+            assert_eq!(serde_json::to_value(meta).unwrap(), value);
+        }
     }
 
     #[test]
@@ -1636,6 +1843,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_credentials_pi_uses_native_model_level_base_url() {
+        let p = provider_with(json!({
+            "apiKey": "sk-pi",
+            "models": [{
+                "id": "model-a",
+                "api": "openai-completions",
+                "baseUrl": "https://api.example.com/v1/"
+            }]
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::Pi),
+            (
+                "https://api.example.com/v1".to_string(),
+                "sk-pi".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn resolve_credentials_opencode_options() {
         // OpenCode (OMO) nests creds under options.{baseURL,apiKey}; useOpencodeFormState
         // writes config.options.apiKey, so the stored provider keeps them there.
@@ -1694,6 +1920,91 @@ mod tests {
         assert_eq!(
             p.resolve_usage_credentials(&AppType::Claude),
             (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_single_preset_shape() {
+        // 预设/表单写入的单供应商形态：provider.{base_url, api_key}
+        let p = provider_with(json!({
+            "provider": {
+                "type": "openai",
+                "api_key": "sk-moonshot",
+                "base_url": "https://api.moonshot.cn/v1"
+            },
+            "models": {},
+            "default_model": ""
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            (
+                "https://api.moonshot.cn/v1".to_string(),
+                "sk-moonshot".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_live_imported_map_shape() {
+        // 从 live config.toml 导入的供应商存整文档：凭据在 providers.<自身id> 下。
+        // 官方 managed:kimi-code 即此形态——修复前解析出空 base_url，Kimi 套餐
+        // 用量查询报 "Unknown coding plan provider"。
+        let mut p = provider_with(json!({
+            "default_model": "kimi-code/k3",
+            "providers": {
+                "managed:kimi-code": {
+                    "type": "kimi",
+                    "api_key": "sk-kimi",
+                    "base_url": "https://api.kimi.com/coding/v1"
+                }
+            },
+            "models": {
+                "kimi-code/k3": { "model": "k3", "provider": "managed:kimi-code" }
+            }
+        }));
+        p.id = "managed:kimi-code".to_string();
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            (
+                "https://api.kimi.com/coding/v1".to_string(),
+                "sk-kimi".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_map_uses_default_model_pointer() {
+        // providers map 键与供应商 id 不一致时，经 models[default_model].provider 定位。
+        let p = provider_with(json!({
+            "default_model": "kimi-code/k3",
+            "providers": {
+                "upstream-a": { "api_key": "sk-a", "base_url": "https://a.example.com/v1" },
+                "upstream-b": { "api_key": "sk-b", "base_url": "https://b.example.com/v1" }
+            },
+            "models": {
+                "kimi-code/k3": { "model": "k3", "provider": "upstream-b" }
+            }
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            ("https://b.example.com/v1".to_string(), "sk-b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_kimicode_single_entry_map_fallback() {
+        // 单条目 providers map：id 与 default_model 都对不上时取唯一条目。
+        let p = provider_with(json!({
+            "providers": {
+                "only-one": { "api_key": "sk-one", "base_url": "https://one.example.com/v1/" }
+            }
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::KimiCode),
+            (
+                "https://one.example.com/v1".to_string(),
+                "sk-one".to_string()
+            )
         );
     }
 }
