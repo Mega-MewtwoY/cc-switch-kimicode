@@ -1,6 +1,16 @@
 # Kimi Code Harness 维护指南
 
-> 2026-10-13：定制源码已更新至 4.0.9，当前定制仓库为 https://github.com/Mega-MewtwoY/cc-switch-kimicode ，定制改动保存在 `main`。以下内容保留作为早期 `feat/kimicode` 分支的历史维护记录；其中的分支关系、版本和启动入口说明不代表当前版本。当前构建方法和启动目标以 [README.md](README.md) 及源码为准。
+> 2026-10-15：定制源码已更新至 4.0.12，当前定制仓库为 https://github.com/Mega-MewtwoY/cc-switch-kimicode ，定制改动保存在 `main`。以下内容保留作为早期 `feat/kimicode` 分支的历史维护记录；其中的分支关系、版本和启动入口说明不代表当前版本。当前构建方法和启动目标以 [README.md](README.md) 及源码为准。
+
+## 当前版本同步
+
+2026-10-15 已从此前整合的上游 `28dc5198` 合并至 `v4.0.12` / `51ac86f1`。Git 历史现已关联上游，后续在当前定制分支执行 `git fetch upstream` 和 `git merge upstream/main` 即可进行三方合并；不要再按下面的历史分支布局操作。
+
+保留 Kimi Code、Kimi Work&Chat、豆包、卡片启动入口、Codex 多账号登录暂存及额度查询、自定义用量和历史数据。新增预设继续移除 GLM 模型，并采用同平台已有的 Kimi 模型作为必要的默认值。Codex 父会话解析同时保留分页拼接、忽略 fork 之后的分页以及检查最新分页进度的逻辑。
+
+验证与安装：先运行 `pnpm typecheck`、`pnpm test:unit`、`cargo test --manifest-path src-tauri/Cargo.toml`，再按 README 构建 `.app`。替换 `/Applications/CC Switch.app` 前退出旧进程并备份应用和 `~/.cc-switch/`，启动后检查版本与定制入口。
+
+## 历史记录
 
 本分支（`feat/kimicode`）在 CC Switch 上游基础上新增 Kimi Code CLI（kimi）支持。
 本文档说明如何在官方更新后同步，保证本改动不被覆盖。

@@ -1,6 +1,6 @@
 # CC Switch（Kimi Code 定制版）
 
-从现有 3.20.4 定制源码升级，已合并上游 4.0.9 及 2026-10-12 核对的 main 分支更新（28dc5198）。保留 Kimi Code CLI、Kimi 桌面端、豆包、自定义用量统计和 Codex 多账号额度等现有功能。上游项目为 https://github.com/farion1231/cc-switch ，定制项目为 https://github.com/Mega-MewtwoY/cc-switch-kimicode 。
+从现有定制源码升级，已合并上游 4.0.12 及 2026-10-15 核对的 main 分支更新（51ac86f1）。保留 Kimi Code CLI、Kimi 桌面端、豆包、自定义用量统计和 Codex 多账号额度等现有功能。上游项目为 https://github.com/farion1231/cc-switch ，定制项目为 https://github.com/Mega-MewtwoY/cc-switch-kimicode 。
 
 本版本不提供 ZCode 应用入口、原生配置、MCP/技能同步或会话扫描，也不在供应商预设中提供 GLM 模型。历史用量和模型定价继续由独立数据表保存；历史数据中的应用标识及数据库迁移兼容逻辑保留。
 
