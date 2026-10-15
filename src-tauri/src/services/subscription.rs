@@ -1594,33 +1594,7 @@ fn codex_credentials_from_auth_value(auth: &serde_json::Value) -> CodexCredentia
         ))
 }
 
-/// 决定按供应商查询时是否用 live 凭据（否则用条目自身快照）
-///
-/// 当前激活条目优先 live（Codex CLI 持续刷新，最新鲜；与共享路径同源，且绝不
-/// 触碰快照 refresh_token，避免与 CLI 的轮换竞争）。但 live 属于别的账号时
-/// （用户在 CLI 手动登录过另一账号）回退快照，保证查到的还是本条目的额度。
-/// 非当前条目恒用自身快照——CLI 不持有这份 refresh_token，就地刷新是安全的。
-fn use_live_codex_credentials(
-    is_current: bool,
-    live: &CodexCredentials,
-    snapshot_account_id: Option<&str>,
-) -> bool {
-    if !is_current {
-        return false;
-    }
-    let (_, live_account, status, _) = live;
-    match status {
-        CredentialStatus::Valid | CredentialStatus::Expired | CredentialStatus::RefreshPending => {
-            match (live_account.as_deref(), snapshot_account_id) {
-                (Some(live_id), Some(snapshot_id)) => live_id == snapshot_id,
-                _ => true, // 无法比对时信任 live（当前条目）
-            }
-        }
-        CredentialStatus::NotFound | CredentialStatus::ParseError => false, // 快照兜底
-    }
-}
-
-/// 把刷新响应写回 `settings_config.auth` 快照
+/// 把刷新响应合并到本机登录凭据束
 ///
 /// OpenAI 的 refresh_token 会轮换：响应带新 refresh_token 时必须落盘，否则
 /// 旧 token 失效后该条目再也无法刷新。id_token 同理按响应更新（可能缺省）。
@@ -1662,96 +1636,120 @@ fn apply_refresh_to_auth(
     }
 }
 
-/// 按供应商查询 Codex 官方订阅额度（每个条目用自己的凭据）
-///
-/// 背景：`get_subscription_quota("codex")` 只读唯一的本机凭据（Keychain /
-/// `~/.codex/auth.json`），属于「当前激活」的那个账号，多个 OpenAI 账号的
-/// 供应商条目无法同时看到各自的额度。
-///
-/// 凭据来源见 `use_live_codex_credentials`。快照 access_token 过期（查询 401）
-/// 时用快照里的 refresh_token 就地刷新一次并写回快照，再重试一次；刷新失败
-/// 则保留「已过期」结果（提示切换到该账号重新登录）。
+/// Read the same device-only login stash used by provider switching. Row auth
+/// is only a one-time migration seed. Never silently fall back on stale rows.
+fn provider_codex_auth(
+    state: &crate::store::AppState,
+    row_auth: &serde_json::Value,
+) -> Result<
+    Option<(
+        serde_json::Value,
+        bool,
+        super::provider::codex_login::LoginStash,
+    )>,
+    String,
+> {
+    use super::provider::codex_login::{LoginStash, STASH_FILENAME};
+    let live = crate::live::engine::read_current(&crate::codex_config::get_codex_auth_path())
+        .map_err(|e| e.to_string())?
+        .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+        .transpose()
+        .map_err(|e| format!("Failed to read live Codex login: {e}"))?;
+    let rows: Vec<serde_json::Value> = state
+        .db
+        .get_all_providers("codex")
+        .map_err(|e| e.to_string())?
+        .values()
+        .filter(|provider| provider.category.as_deref() == Some("official"))
+        .filter_map(|provider| provider.settings_config.get("auth").cloned())
+        .collect();
+    let path = crate::live::engine::DeviceStore::for_device().file(STASH_FILENAME);
+    let stash = match crate::live::engine::read_current(&path).map_err(|e| e.to_string())? {
+        Some(bytes) => serde_json::from_slice::<LoginStash>(&bytes)
+            .map_err(|e| format!("Failed to read Codex login stash: {e}"))?
+            .loaded(&rows, live.as_ref()),
+        None => LoginStash::seeded_from_rows(&rows),
+    };
+    Ok(stash
+        .quota_auth(row_auth, live.as_ref())
+        .map(|(auth, is_live)| (auth.clone(), is_live, stash.clone())))
+}
+
+/// Query each official card with its current device credentials, regardless of
+/// the selected provider (including third parties preserving an official login).
+/// Switches and inactive refreshes share one lock. Ordinary network reads do not
+/// hold it; after a 401, re-read under the lock before rotating anything.
 pub async fn get_provider_codex_quota(
     state: &crate::store::AppState,
     provider_id: &str,
 ) -> Result<SubscriptionQuota, String> {
+    use super::provider::codex_login::STASH_FILENAME;
     let provider = state
         .db
         .get_provider_by_id(provider_id, "codex")
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
-
-    let snapshot_auth = provider
+    let Some(row_auth) = provider
         .settings_config
         .get("auth")
-        .filter(|auth| crate::codex_config::codex_auth_has_oauth_login_material(auth));
-
-    let Some(auth) = snapshot_auth else {
-        // 条目没有自己的 OAuth 登录快照（纯 CLI 登录 / 第三方）：退回共享路径。
+        .filter(|auth| crate::codex_config::codex_auth_has_oauth_login_material(auth))
+    else {
         return get_subscription_quota("codex").await;
     };
+    let initial = {
+        let _guard =
+            crate::mode::controller::lock_settled(state, &crate::app_config::AppType::Codex)
+                .await
+                .map_err(|e| e.to_string())?;
+        provider_codex_auth(state, row_auth)?
+    };
+    let Some((auth, _, _)) = initial else {
+        return Ok(SubscriptionQuota::not_found("codex"));
+    };
+    let quota = query_codex_quota_via_credentials(codex_credentials_from_auth_value(&auth)).await?;
+    if quota.success || quota.credential_status != CredentialStatus::Expired {
+        return Ok(quota);
+    }
 
-    let snapshot = codex_credentials_from_auth_value(auth);
-    let snapshot_account_id = snapshot.1.clone();
-    let snapshot_refresh_token = auth
+    let _guard = crate::mode::controller::lock_settled(state, &crate::app_config::AppType::Codex)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some((mut current_auth, is_live, mut stash)) = provider_codex_auth(state, row_auth)? else {
+        return Ok(SubscriptionQuota::not_found("codex"));
+    };
+    // Another query or CLI may have updated credentials while the request was
+    // in flight. Retry the latest generation before considering a refresh.
+    let quota = if current_auth != auth {
+        query_codex_quota_via_credentials(codex_credentials_from_auth_value(&current_auth)).await?
+    } else {
+        quota
+    };
+    if quota.success || quota.credential_status != CredentialStatus::Expired || is_live {
+        // Codex owns live token refresh; do not race its independent process.
+        return Ok(quota);
+    }
+    let Some(refresh_token) = current_auth
         .pointer("/tokens/refresh_token")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-
-    let is_current = crate::mode::current::provider_for(
-        &state.db,
-        &crate::app_config::AppType::Codex,
-        crate::mode::current::Purpose::Direct,
-    )
-    .ok()
-    .flatten()
-    .as_deref()
-        == Some(provider_id);
-
-    let live = read_codex_credentials();
-    if use_live_codex_credentials(is_current, &live, snapshot_account_id.as_deref()) {
-        return query_codex_quota_via_credentials(live).await;
-    }
-
-    let quota = query_codex_quota_via_credentials(snapshot).await?;
-
-    // 401（Expired 且未成功）→ 有 refresh_token 就刷新一次、写回快照、重试一次。
-    let needs_refresh = !quota.success && quota.credential_status == CredentialStatus::Expired;
-    if !needs_refresh {
-        return Ok(quota);
-    }
-    let Some(refresh_token) = snapshot_refresh_token else {
+    else {
         return Ok(quota);
     };
-
-    let refreshed =
-        crate::proxy::providers::codex_oauth_auth::refresh_codex_oauth_token(&refresh_token).await;
-    let Ok(resp) = refreshed else {
-        // 刷新失败（refresh_token 失效等）：保留原「已过期」结果与提示。
-        return Ok(quota);
+    use crate::proxy::providers::codex_oauth_auth::{refresh_codex_oauth_token, CodexOAuthError};
+    let resp = match refresh_codex_oauth_token(refresh_token).await {
+        Ok(resp) => resp,
+        Err(CodexOAuthError::RefreshTokenInvalid) => return Ok(quota),
+        Err(e) => return Err(format!("Codex login refresh failed: {e}")),
     };
-
-    let mut settings = provider.settings_config.clone();
-    if let Some(auth_value) = settings.get_mut("auth") {
-        apply_refresh_to_auth(auth_value, &resp);
-        if let Err(e) = state
-            .db
-            .update_provider_settings_config("codex", provider_id, &settings)
-        {
-            log::warn!(
-                "Failed to persist refreshed Codex auth snapshot for provider {provider_id}: {e}"
-            );
-        }
+    apply_refresh_to_auth(&mut current_auth, &resp);
+    // Migration seeds are already in the stash. Persist the rotated bundle here,
+    // so switching back restores it instead of an invalidated old generation.
+    if !stash.replace_quota_auth(current_auth.clone()) {
+        return Err("Codex login was removed during quota refresh".to_string());
     }
-
-    query_codex_quota(
-        &resp.access_token,
-        snapshot_account_id.as_deref(),
-        "codex",
-        "Authentication failed. Please re-login with Codex CLI.",
-    )
-    .await
+    let path = crate::live::engine::DeviceStore::for_device().file(STASH_FILENAME);
+    crate::config::write_json_file_private(&path, &stash).map_err(|e| e.to_string())?;
+    query_codex_quota_via_credentials(codex_credentials_from_auth_value(&current_auth)).await
 }
 
 /// 查询指定 CLI 工具的官方订阅额度
@@ -2190,31 +2188,6 @@ mod tests {
         api_key_only["auth_mode"] = serde_json::json!("api_key");
         let (_, _, status, _) = codex_credentials_from_auth_value(&api_key_only);
         assert!(matches!(status, CredentialStatus::NotFound));
-    }
-
-    #[test]
-    fn live_credentials_used_only_for_matching_current_account() {
-        let live_ok = (
-            Some("live-access".to_string()),
-            Some("acct-x".to_string()),
-            CredentialStatus::Valid,
-            None,
-        );
-        // 非当前条目：恒用快照
-        assert!(!use_live_codex_credentials(false, &live_ok, Some("acct-x")));
-        // 当前条目 + live 账号一致：用 live（CLI 在管，最新鲜）
-        assert!(use_live_codex_credentials(true, &live_ok, Some("acct-x")));
-        // 当前条目但 live 属于别的账号（CLI 手动登录过）：回退快照
-        assert!(!use_live_codex_credentials(true, &live_ok, Some("acct-y")));
-        // 当前条目 + 无法比对账号：信任 live
-        assert!(use_live_codex_credentials(true, &live_ok, None));
-        // live 缺失/损坏：快照兜底
-        let live_missing = (None, None, CredentialStatus::NotFound, None);
-        assert!(!use_live_codex_credentials(
-            true,
-            &live_missing,
-            Some("acct-x")
-        ));
     }
 
     #[test]

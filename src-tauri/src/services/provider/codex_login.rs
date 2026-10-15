@@ -119,6 +119,30 @@ impl LoginStash {
         }
     }
 
+    /// Quota reads share the switcher's device credentials. A row is only an
+    /// identity hint after initialization, never a second refresh-token owner.
+    pub(crate) fn quota_auth<'a>(
+        &'a self,
+        row_auth: &Value,
+        live: Option<&'a Value>,
+    ) -> Option<(&'a Value, bool)> {
+        let wanted = oauth_identity(row_auth)?;
+        if let Some(auth) = live.filter(|auth| oauth_identity(auth).as_ref() == Some(&wanted)) {
+            return Some((auth, true));
+        }
+        self.logins.get(&wanted).map(|auth| (auth, false))
+    }
+
+    /// Replace only an existing inactive login; quota refresh must not change
+    /// the last-login pointer or revive a login removed by logout.
+    pub(crate) fn replace_quota_auth(&mut self, auth: Value) -> bool {
+        let Some(saved) = self.logins.get_mut(&identity(&auth)) else {
+            return false;
+        };
+        *saved = auth;
+        true
+    }
+
     fn put(&mut self, auth: &Value) {
         let id = identity(auth);
         self.logins.insert(id.clone(), auth.clone());
@@ -345,6 +369,64 @@ mod tests {
 
     fn key(account: &str) -> String {
         format!("sub:user-{account}|account:{account}")
+    }
+
+    #[test]
+    fn quota_reads_rotated_stash_instead_of_stale_row() {
+        let row = login("y");
+        let mut rotated = row.clone();
+        rotated["tokens"]["access_token"] = json!("latest-access");
+        rotated["tokens"]["refresh_token"] = json!("latest-refresh");
+        let mut stash = ready();
+        stash.put(&rotated);
+        let other = login("x");
+        assert_eq!(
+            stash.quota_auth(&row, Some(&other)),
+            Some((&rotated, false))
+        );
+        assert_eq!(stash.quota_auth(&row, None), Some((&rotated, false)));
+    }
+
+    #[test]
+    fn quota_uses_matching_live_login_even_when_third_party_is_selected() {
+        let row = login("y");
+        let mut live = row.clone();
+        live["tokens"]["refresh_token"] = json!("cli-rotated");
+        let stash = LoginStash::seeded_from_rows([&row]);
+        assert_eq!(stash.quota_auth(&row, Some(&live)), Some((&live, true)));
+        let other_workspace = workspace_login("user-y", "team");
+        assert_eq!(
+            stash.quota_auth(&row, Some(&other_workspace)),
+            Some((&row, false))
+        );
+    }
+
+    #[test]
+    fn quota_never_revives_logged_out_rows() {
+        let row = login("y");
+        let mut stash = ready();
+        assert!(stash.quota_auth(&row, None).is_none());
+        assert!(!stash.replace_quota_auth(row));
+        assert!(stash.logins.is_empty());
+    }
+
+    #[test]
+    fn quota_rotation_is_restored_when_switching_back() {
+        let x = login("x");
+        let row_y = login("y");
+        let mut stash = ready();
+        stash.put(&row_y);
+        let mut refreshed_y = row_y.clone();
+        refreshed_y["tokens"]["refresh_token"] = json!("quota-rotated");
+        let last = stash.last.clone();
+        assert!(stash.replace_quota_auth(refreshed_y.clone()));
+        assert_eq!(stash.last, last);
+        let result = plan(input(
+            Some(&x),
+            AuthTarget::Official { row_auth: &row_y },
+            stash,
+        ));
+        assert_eq!(result.auth, Some(Some(refreshed_y)));
     }
 
     fn input<'a>(

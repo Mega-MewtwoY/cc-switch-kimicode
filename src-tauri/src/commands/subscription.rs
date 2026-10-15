@@ -16,8 +16,8 @@ use crate::store::AppState;
 /// react-query reject 保留上次 data 的语义一致（emit 失败快照会经
 /// `useUsageCacheBridge` 盲写回 query 缓存，抹掉本该保留的旧值）。
 ///
-/// `provider_id`（仅 codex）：按供应商条目查询——当前条目仍用 live 凭据，
-/// 其他条目用各自的 auth 快照（见 `get_provider_codex_quota`）。缓存与托盘
+/// `provider_id`（仅 codex）：按供应商身份查询最新 live / 本机登录暂存，
+/// 配置行中的 auth 只用于识别账号（见 `get_provider_codex_quota`）。缓存与托盘
 /// 只反映「当前激活」账号：按 provider 查询仅当该条目恰为当前条目时才写
 /// 快照并 emit，避免多个 OpenAI 账号各自轮询互相覆盖托盘数字。
 #[tauri::command(rename_all = "camelCase")]
